@@ -1,444 +1,589 @@
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");
+const https = require("https");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const PALPLUSS_API_KEY = process.env.PALPLUSS_API_KEY || "";
+const CALLBACK_BASE_URL = process.env.CALLBACK_BASE_URL || "";
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
-// Replace these with your actual HashBack credentials
-const HASHBACK_API_KEY = process.env.HASHBACK_API_KEY || "YOUR_API_KEY_HERE";
-const HASHBACK_ACCOUNT_ID = process.env.HASHBACK_ACCOUNT_ID || "YOUR_ACCOUNT_ID_HERE";
-const HASHBACK_BASE_URL = "https://api.hashback.co.ke";
+// In-memory store for transactions (replace with a DB in production)
+const transactions = {};
 
-// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
-app.use(cors()); // Allow all frontends
+// ─── Middleware ────────────────────────────────────────────────────────────────
+
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
+// ─── Helper: Make HTTPS request to PalPluss API ───────────────────────────────
 
-/**
- * Normalize phone number to 2547XXXXXXXX format.
- * Accepts: 07XXXXXXXX, 7XXXXXXXX, 2547XXXXXXXX
- */
-function normalizePhone(phone) {
-  const cleaned = String(phone).trim().replace(/\s+/g, "");
-  if (/^2547\d{8}$/.test(cleaned)) return cleaned;
-  if (/^07\d{8}$/.test(cleaned)) return "254" + cleaned.slice(1);
-  if (/^7\d{8}$/.test(cleaned)) return "254" + cleaned;
-  return null;
-}
+function palplussRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const bodyData = body ? JSON.stringify(body) : null;
+    const auth = Buffer.from(`${PALPLUSS_API_KEY}:`).toString("base64");
 
-/**
- * Extract a readable error message from an axios error or plain Error.
- */
-function extractErrorMessage(err) {
-  if (err.response) {
-    const data = err.response.data;
-    if (typeof data === "string") return data;
-    if (data && data.message) return data.message;
-    if (data && data.error) {
-      if (typeof data.error === "string") return data.error;
-      if (data.error.message) return data.error.message;
+    const options = {
+      hostname: "api.palpluss.com",
+      port: 443,
+      path: `/v1${path}`,
+      method: method,
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+    };
+
+    if (bodyData) {
+      options.headers["Content-Length"] = Buffer.byteLength(bodyData);
     }
-    return `API responded with status ${err.response.status}: ${JSON.stringify(data)}`;
-  }
-  if (err.request) return "No response received from payment gateway. Please check your internet connection.";
-  return err.message || "An unknown error occurred.";
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve({ statusCode: res.statusCode, body: parsed });
+        } catch {
+          resolve({ statusCode: res.statusCode, body: data });
+        }
+      });
+    });
+
+    req.on("error", (err) => {
+      reject(err);
+    });
+
+    if (bodyData) {
+      req.write(bodyData);
+    }
+
+    req.end();
+  });
 }
 
-/**
- * Build a coloured HTML receipt string.
- */
-function buildReceipt(data) {
-  const {
-    name,
-    phone,
-    amount,
-    transactionId,
-    receipt,
-    transactionDate,
-    reference,
-  } = data;
+// ─── Helper: Format error message as plain text ───────────────────────────────
 
-  const date = transactionDate
-    ? new Date(String(transactionDate).replace(
-        /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/,
-        "$1-$2-$3T$4:$5:$6"
-      )).toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })
-    : new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" });
+function formatError(err, context) {
+  if (typeof err === "string") return `Error: ${err}`;
+
+  const parts = [`Error during ${context || "request"}.`];
+
+  if (err.message) parts.push(`Message: ${err.message}`);
+  if (err.code) parts.push(`Code: ${err.code}`);
+  if (err.error) {
+    if (err.error.message) parts.push(`API Error: ${err.error.message}`);
+    if (err.error.code) parts.push(`API Code: ${err.error.code}`);
+    if (err.error.details && Object.keys(err.error.details).length > 0) {
+      parts.push(`Details: ${JSON.stringify(err.error.details)}`);
+    }
+  }
+  if (err.requestId) parts.push(`Request ID (for support): ${err.requestId}`);
+
+  return parts.join("\n");
+}
+
+// ─── Helper: Generate HTML Receipt ────────────────────────────────────────────
+
+function buildReceipt(txn) {
+  const statusColor =
+    txn.status === "SUCCESS"
+      ? "#16a34a"
+      : txn.status === "FAILED"
+        ? "#dc2626"
+        : "#d97706";
+
+  const statusEmoji =
+    txn.status === "SUCCESS"
+      ? "✅"
+      : txn.status === "FAILED"
+        ? "❌"
+        : "⏳";
+
+  const date = txn.completedAt
+    ? new Date(txn.completedAt).toLocaleString("en-KE", {
+        timeZone: "Africa/Nairobi",
+        dateStyle: "long",
+        timeStyle: "medium",
+      })
+    : new Date().toLocaleString("en-KE", {
+        timeZone: "Africa/Nairobi",
+        dateStyle: "long",
+        timeStyle: "medium",
+      });
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Payment Receipt</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: 'Segoe UI', Arial, sans-serif;
-      background: #f0fdf4;
-      display: flex;
-      justify-content: center;
-      align-items: center;
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
       min-height: 100vh;
-      padding: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
     }
     .receipt {
       background: #ffffff;
       border-radius: 16px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.12);
-      max-width: 420px;
       width: 100%;
+      max-width: 420px;
       overflow: hidden;
+      box-shadow: 0 25px 60px rgba(0,0,0,0.4);
     }
-    .receipt-header {
+    .header {
       background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
       color: white;
-      padding: 28px 24px;
+      padding: 28px 24px 20px;
       text-align: center;
     }
-    .receipt-header .check-icon {
-      font-size: 48px;
-      margin-bottom: 8px;
+    .header .logo {
+      font-size: 36px;
+      margin-bottom: 6px;
     }
-    .receipt-header h1 {
-      font-size: 22px;
+    .header h1 {
+      font-size: 20px;
       font-weight: 700;
       letter-spacing: 0.5px;
     }
-    .receipt-header p {
+    .header p {
       font-size: 13px;
       opacity: 0.85;
       margin-top: 4px;
     }
-    .receipt-body {
-      padding: 24px;
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: ${statusColor};
+      color: white;
+      font-weight: 700;
+      font-size: 14px;
+      padding: 6px 18px;
+      border-radius: 999px;
+      margin-top: 12px;
+      letter-spacing: 0.5px;
     }
     .amount-block {
-      background: #f0fdf4;
-      border: 2px solid #bbf7d0;
-      border-radius: 12px;
+      background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
       text-align: center;
-      padding: 20px;
-      margin-bottom: 20px;
+      padding: 20px 24px;
+      border-bottom: 2px dashed #d1d5db;
     }
-    .amount-block .label {
+    .amount-label {
       font-size: 12px;
       color: #6b7280;
       text-transform: uppercase;
       letter-spacing: 1px;
-      margin-bottom: 6px;
+      font-weight: 600;
     }
-    .amount-block .amount {
-      font-size: 36px;
+    .amount-value {
+      font-size: 42px;
       font-weight: 800;
       color: #15803d;
+      margin-top: 4px;
     }
-    .amount-block .currency {
-      font-size: 18px;
+    .amount-currency {
+      font-size: 20px;
       font-weight: 600;
       color: #16a34a;
     }
-    .details-table {
-      width: 100%;
-      border-collapse: collapse;
+    .details {
+      padding: 20px 24px;
     }
-    .details-table tr {
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      padding: 10px 0;
       border-bottom: 1px solid #f3f4f6;
     }
-    .details-table tr:last-child {
-      border-bottom: none;
-    }
-    .details-table td {
-      padding: 10px 4px;
-      font-size: 14px;
-    }
-    .details-table td:first-child {
-      color: #6b7280;
-      font-weight: 500;
-      width: 40%;
-    }
-    .details-table td:last-child {
-      color: #111827;
-      font-weight: 600;
-      text-align: right;
-    }
-    .receipt-footer {
-      background: #f9fafb;
-      border-top: 1px solid #e5e7eb;
-      padding: 16px 24px;
-      text-align: center;
-    }
-    .receipt-footer p {
+    .row:last-child { border-bottom: none; }
+    .row-label {
       font-size: 12px;
       color: #9ca3af;
-    }
-    .badge {
-      display: inline-block;
-      background: #dcfce7;
-      color: #15803d;
-      font-size: 11px;
-      font-weight: 700;
-      padding: 3px 10px;
-      border-radius: 999px;
-      letter-spacing: 0.5px;
       text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 600;
+      flex-shrink: 0;
+      padding-right: 12px;
+    }
+    .row-value {
+      font-size: 14px;
+      color: #111827;
+      font-weight: 500;
+      text-align: right;
+      word-break: break-all;
+    }
+    .footer {
+      background: #f9fafb;
+      text-align: center;
+      padding: 16px 24px;
+      border-top: 2px dashed #d1d5db;
+    }
+    .footer p {
+      font-size: 11px;
+      color: #9ca3af;
+      line-height: 1.6;
+    }
+    .footer .powered {
+      font-weight: 700;
+      color: #6b7280;
+    }
+    .watermark {
+      font-size: 10px;
+      color: #d1d5db;
+      margin-top: 8px;
+      letter-spacing: 0.5px;
     }
   </style>
 </head>
 <body>
   <div class="receipt">
-    <div class="receipt-header">
-      <div class="check-icon">✅</div>
-      <h1>Payment Successful</h1>
-      <p>M-Pesa STK Push — Deposit Confirmed</p>
+    <div class="header">
+      <div class="logo">📱</div>
+      <h1>M-Pesa Payment Receipt</h1>
+      <p>Powered by PalPluss</p>
+      <div class="status-badge">${statusEmoji} ${txn.status || "PENDING"}</div>
     </div>
-    <div class="receipt-body">
-      <div class="amount-block">
-        <div class="label">Amount Paid</div>
-        <div class="amount"><span class="currency">KES </span>${Number(amount).toLocaleString("en-KE")}</div>
+
+    <div class="amount-block">
+      <div class="amount-label">Amount Paid</div>
+      <div class="amount-value">
+        <span class="amount-currency">KES </span>${Number(txn.amount || 0).toLocaleString("en-KE")}
       </div>
-      <table class="details-table">
-        <tr>
-          <td>Customer Name</td>
-          <td>${escapeHtml(name)}</td>
-        </tr>
-        <tr>
-          <td>Phone Number</td>
-          <td>${escapeHtml(phone)}</td>
-        </tr>
-        <tr>
-          <td>M-Pesa Receipt</td>
-          <td>${escapeHtml(receipt || transactionId || "N/A")}</td>
-        </tr>
-        <tr>
-          <td>Reference</td>
-          <td>${escapeHtml(reference || "DEPOSIT")}</td>
-        </tr>
-        <tr>
-          <td>Date &amp; Time</td>
-          <td>${date}</td>
-        </tr>
-        <tr>
-          <td>Status</td>
-          <td><span class="badge">Paid</span></td>
-        </tr>
-      </table>
     </div>
-    <div class="receipt-footer">
-      <p>Thank you for your payment. Keep this receipt for your records.</p>
+
+    <div class="details">
+      <div class="row">
+        <span class="row-label">Customer</span>
+        <span class="row-value">${txn.customerName || "—"}</span>
+      </div>
+      <div class="row">
+        <span class="row-label">Phone</span>
+        <span class="row-value">${txn.phone || "—"}</span>
+      </div>
+      <div class="row">
+        <span class="row-label">Transaction ID</span>
+        <span class="row-value" style="font-family:monospace;font-size:12px;">${txn.transactionId || "—"}</span>
+      </div>
+      ${
+        txn.mpesaReceiptNumber
+          ? `<div class="row">
+        <span class="row-label">M-Pesa Ref</span>
+        <span class="row-value" style="font-weight:700;color:#15803d;">${txn.mpesaReceiptNumber}</span>
+      </div>`
+          : ""
+      }
+      <div class="row">
+        <span class="row-label">Date &amp; Time</span>
+        <span class="row-value">${date}</span>
+      </div>
+      ${
+        txn.resultDesc
+          ? `<div class="row">
+        <span class="row-label">Note</span>
+        <span class="row-value" style="color:${statusColor};">${txn.resultDesc}</span>
+      </div>`
+          : ""
+      }
+    </div>
+
+    <div class="footer">
+      <p class="powered">PalPluss Payment Services</p>
+      <p>This is an official payment receipt.<br/>Keep it for your records.</p>
+      <p class="watermark">Generated on ${new Date().toISOString()}</p>
     </div>
   </div>
 </body>
 </html>`;
 }
 
-function escapeHtml(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
+// ─── Routes ────────────────────────────────────────────────────────────────────
 
-// ─── ROUTES ───────────────────────────────────────────────────────────────────
+// Health check
+app.get("/", (req, res) => {
+  res.json({ status: "ok", message: "Payment server is running." });
+});
 
-/**
- * POST /deposit
- * Body: { amount, phone, name }
- * Initiates STK push.
- * Returns: { success, message, checkout_id }
- */
-app.post("/deposit", async (req, res) => {
-  const { amount, phone, name } = req.body;
+// ── POST /pay ── Initiate STK Push ────────────────────────────────────────────
+app.post("/pay", async (req, res) => {
+  const { name, phone, amount } = req.body;
 
   // Validate inputs
-  if (!amount || !phone || !name) {
-    return res.status(400).type("text").send(
-      "Missing required fields: amount, phone, and name are all required."
-    );
+  if (!name || String(name).trim() === "") {
+    return res
+      .status(400)
+      .type("text")
+      .send("Error: Customer name is required.");
   }
-
-  const parsedAmount = parseFloat(amount);
-  if (isNaN(parsedAmount) || parsedAmount <= 0) {
-    return res.status(400).type("text").send(
-      "Invalid amount. Please enter a positive number greater than zero."
-    );
+  if (!phone || String(phone).trim() === "") {
+    return res
+      .status(400)
+      .type("text")
+      .send("Error: Phone number is required.");
   }
-
-  const msisdn = normalizePhone(phone);
-  if (!msisdn) {
-    return res.status(400).type("text").send(
-      "Invalid phone number. Please use the format 07XXXXXXXX or 2547XXXXXXXX."
-    );
+  if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+    return res
+      .status(400)
+      .type("text")
+      .send("Error: A valid amount greater than 0 is required.");
   }
-
-  const reference = encodeURIComponent(`DEPOSIT-${Date.now()}`);
-
-  try {
-    const response = await axios.post(
-      `${HASHBACK_BASE_URL}/initiatestk`,
-      {
-        api_key: HASHBACK_API_KEY,
-        account_id: HASHBACK_ACCOUNT_ID,
-        amount: String(Math.round(parsedAmount)),
-        msisdn: msisdn,
-        reference: reference,
-      },
-      { headers: { "Content-Type": "application/json" }, timeout: 30000 }
-    );
-
-    const data = response.data;
-
-    if (!data.success) {
-      const errMsg = data.message || "STK push was not initiated. Please try again.";
-      return res.status(502).type("text").send(
-        `Payment gateway error: ${errMsg}`
+  if (!PALPLUSS_API_KEY) {
+    return res
+      .status(500)
+      .type("text")
+      .send(
+        "Error: PALPLUSS_API_KEY is not configured on the server. Contact the administrator."
       );
-    }
-
-    return res.json({
-      success: true,
-      message: data.message || "STK push sent to your phone. Please enter your M-Pesa PIN.",
-      checkout_id: data.checkout_id,
-      phone: msisdn,
-      amount: Math.round(parsedAmount),
-      name: name,
-    });
-  } catch (err) {
-    const message = extractErrorMessage(err);
-    return res.status(502).type("text").send(
-      `Failed to initiate STK push: ${message}`
-    );
   }
-});
-
-/**
- * POST /check-status
- * Body: { checkout_id, name, phone, amount }
- * Checks the transaction status.
- * Returns: On success → HTML receipt. On pending/failure → text message.
- */
-app.post("/check-status", async (req, res) => {
-  const { checkout_id, name, phone, amount } = req.body;
-
-  if (!checkout_id) {
-    return res.status(400).type("text").send(
-      "Missing checkout_id. Please provide the checkout ID from the STK push."
-    );
+  if (!CALLBACK_BASE_URL) {
+    return res
+      .status(500)
+      .type("text")
+      .send(
+        "Error: CALLBACK_BASE_URL is not configured on the server. Contact the administrator."
+      );
   }
+
+  const callbackUrl = `${CALLBACK_BASE_URL.replace(/\/$/, "")}/webhook`;
 
   try {
-    const response = await axios.post(
-      `${HASHBACK_BASE_URL}/transactionstatus`,
-      {
-        api_key: HASHBACK_API_KEY,
-        account_id: HASHBACK_ACCOUNT_ID,
-        checkoutid: checkout_id,
-      },
-      { headers: { "Content-Type": "application/json" }, timeout: 30000 }
-    );
+    const response = await palplussRequest("POST", "/payments/stk", {
+      amount: Number(amount),
+      phone: String(phone).trim(),
+      accountReference: `DEP-${Date.now()}`,
+      transactionDesc: `Deposit by ${String(name).trim()}`,
+      callbackUrl,
+    });
 
-    const data = response.data;
-
-    // ResultCode "0" = success per HashBack docs
-    if (String(data.ResultCode) === "0") {
-      const receiptHtml = buildReceipt({
-        name: name || "Customer",
-        phone: phone || "",
-        amount: amount || 0,
-        transactionId: data.CheckoutRequestID || checkout_id,
-        receipt: data.TransactionReceipt || data.MerchantRequestID || "",
-        transactionDate: data.TransactionDate || null,
-        reference: data.TransactionReference || "",
-      });
-      return res.status(200).type("html").send(receiptHtml);
+    if (response.body.success === false) {
+      const errMsg = formatError(response.body, "STK Push initiation");
+      return res.status(response.statusCode || 400).type("text").send(errMsg);
     }
 
-    // Non-zero result code
-    const desc = data.ResultDesc || data.ResponseDescription || "Transaction not yet confirmed.";
-    const resultCode = data.ResultCode;
+    const txnData = response.body.data || {};
+    const txnId = txnData.transactionId;
 
-    // Common M-Pesa result codes
-    const codeMessages = {
-      "1032": "Payment cancelled. You cancelled the M-Pesa prompt on your phone.",
-      "1037": "Payment timed out. The STK push request expired without response.",
-      "1": "Insufficient M-Pesa balance to complete this payment.",
-      "2001": "Incorrect M-Pesa PIN entered. Please try again.",
+    // Store transaction metadata
+    transactions[txnId] = {
+      transactionId: txnId,
+      customerName: String(name).trim(),
+      phone: txnData.phone || String(phone).trim(),
+      amount: txnData.amount || Number(amount),
+      currency: txnData.currency || "KES",
+      status: txnData.status || "PENDING",
+      createdAt: new Date().toISOString(),
     };
 
-    const friendlyMsg = codeMessages[String(resultCode)] || desc;
-    return res.status(200).type("text").send(
-      `Transaction status: ${friendlyMsg} (Code: ${resultCode})`
-    );
+    return res.status(200).json({
+      success: true,
+      message:
+        "STK Push sent successfully. Please check your phone and enter your M-Pesa PIN to complete the payment.",
+      transactionId: txnId,
+      phone: txnData.phone,
+      amount: txnData.amount,
+      currency: txnData.currency || "KES",
+      status: txnData.status || "PENDING",
+    });
   } catch (err) {
-    const message = extractErrorMessage(err);
-    return res.status(502).type("text").send(
-      `Failed to check transaction status: ${message}`
+    const errMsg = formatError(
+      err,
+      "connecting to payment gateway (STK Push)"
     );
+    return res.status(500).type("text").send(errMsg);
   }
 });
 
-/**
- * POST /webhook
- * HashBack sends payment confirmation here automatically.
- * Configure this URL in your HashBack portal settings.
- * Body: webhook payload from HashBack
- */
-app.post("/webhook", async (req, res) => {
+// ── POST /webhook ── PalPluss callback handler ────────────────────────────────
+app.post("/webhook", (req, res) => {
   const payload = req.body;
 
-  console.log("[WEBHOOK] Received payment callback:", JSON.stringify(payload, null, 2));
+  const txn = payload.transaction || {};
+  const txnId = txn.id;
 
-  // Respond immediately with 200 so HashBack knows we received it
-  res.status(200).json({ received: true });
+  if (txnId && transactions[txnId]) {
+    transactions[txnId].status = txn.status || transactions[txnId].status;
+    transactions[txnId].resultCode = txn.result_code;
+    transactions[txnId].resultDesc = txn.result_desc;
+    transactions[txnId].mpesaReceiptNumber =
+      txn.mpesa_receipt_number || txn.mpesaReceiptNumber;
+    transactions[txnId].completedAt = new Date().toISOString();
+  } else if (txnId) {
+    // Store even if we don't have the original metadata
+    transactions[txnId] = {
+      transactionId: txnId,
+      status: txn.status,
+      amount: txn.amount,
+      phone: txn.phone_number,
+      resultCode: txn.result_code,
+      resultDesc: txn.result_desc,
+      mpesaReceiptNumber: txn.mpesa_receipt_number || txn.mpesaReceiptNumber,
+      currency: txn.currency || "KES",
+      completedAt: new Date().toISOString(),
+    };
+  }
 
-  // Process the payment confirmation
-  const {
-    ResponseCode,
-    ResultCode,
-    TransactionID,
-    TransactionAmount,
-    TransactionReceipt,
-    TransactionDate,
-    TransactionReference,
-    Msisdn,
-  } = payload;
+  // Always return 200 to PalPluss so it doesn't retry
+  return res.status(200).json({ received: true });
+});
 
-  if (String(ResultCode) === "0" || String(ResponseCode) === "0") {
-    console.log(`[WEBHOOK] ✅ Payment CONFIRMED — Receipt: ${TransactionReceipt}, Amount: KES ${TransactionAmount}, MSISDN: ${Msisdn}`);
-    // TODO: Update your database here to mark payment as complete
-  } else {
-    console.log(`[WEBHOOK] ❌ Payment FAILED — Code: ${ResultCode}, Ref: ${TransactionReference}`);
-    // TODO: Update your database here to mark payment as failed
+// ── GET /status/:transactionId ── Poll transaction status ─────────────────────
+app.get("/status/:transactionId", async (req, res) => {
+  const { transactionId } = req.params;
+
+  if (!transactionId) {
+    return res
+      .status(400)
+      .type("text")
+      .send("Error: Transaction ID is required.");
+  }
+
+  // Check local store first
+  const local = transactions[transactionId];
+  if (local && (local.status === "SUCCESS" || local.status === "FAILED")) {
+    return res.status(200).json({
+      success: true,
+      transactionId,
+      status: local.status,
+      amount: local.amount,
+      currency: local.currency || "KES",
+      phone: local.phone,
+      customerName: local.customerName,
+      resultCode: local.resultCode,
+      resultDesc: local.resultDesc,
+      mpesaReceiptNumber: local.mpesaReceiptNumber,
+    });
+  }
+
+  // Otherwise poll PalPluss API
+  if (!PALPLUSS_API_KEY) {
+    return res
+      .status(500)
+      .type("text")
+      .send(
+        "Error: PALPLUSS_API_KEY is not configured on the server. Cannot query status."
+      );
+  }
+
+  try {
+    const response = await palplussRequest(
+      "GET",
+      `/transactions/${transactionId}`
+    );
+
+    if (response.body.success === false) {
+      const errMsg = formatError(response.body, "fetching transaction status");
+      return res.status(response.statusCode || 400).type("text").send(errMsg);
+    }
+
+    const txn = response.body.data || {};
+
+    // Merge API response into local store
+    if (transactions[transactionId]) {
+      transactions[transactionId].status = txn.status || "PENDING";
+      transactions[transactionId].resultCode = txn.resultCode || txn.result_code;
+      transactions[transactionId].resultDesc = txn.resultDesc || txn.result_desc;
+      transactions[transactionId].mpesaReceiptNumber =
+        txn.mpesaReceiptNumber || txn.mpesa_receipt_number;
+    } else {
+      transactions[transactionId] = {
+        transactionId,
+        status: txn.status || "PENDING",
+        amount: txn.amount,
+        phone: txn.phone,
+        currency: txn.currency || "KES",
+        resultCode: txn.resultCode || txn.result_code,
+        resultDesc: txn.resultDesc || txn.result_desc,
+        mpesaReceiptNumber: txn.mpesaReceiptNumber || txn.mpesa_receipt_number,
+      };
+    }
+
+    return res.status(200).json({
+      success: true,
+      transactionId,
+      status: txn.status || "PENDING",
+      amount: txn.amount,
+      currency: txn.currency || "KES",
+      phone: txn.phone,
+      customerName: transactions[transactionId]?.customerName,
+      resultCode: txn.resultCode || txn.result_code,
+      resultDesc: txn.resultDesc || txn.result_desc,
+      mpesaReceiptNumber: txn.mpesaReceiptNumber || txn.mpesa_receipt_number,
+    });
+  } catch (err) {
+    const errMsg = formatError(
+      err,
+      "connecting to payment gateway (status check)"
+    );
+    return res.status(500).type("text").send(errMsg);
   }
 });
 
-/**
- * GET /
- * Simple health check
- */
-app.get("/", (req, res) => {
-  res.type("text").send("HashBack Deposit Server is running. Endpoints: POST /deposit, POST /check-status, POST /webhook");
+// ── GET /receipt/:transactionId ── Coloured HTML receipt ──────────────────────
+app.get("/receipt/:transactionId", (req, res) => {
+  const { transactionId } = req.params;
+
+  if (!transactionId) {
+    return res
+      .status(400)
+      .type("text")
+      .send("Error: Transaction ID is required.");
+  }
+
+  const txn = transactions[transactionId];
+
+  if (!txn) {
+    return res
+      .status(404)
+      .type("text")
+      .send(
+        `Error: No transaction found with ID "${transactionId}".\n` +
+          `Make sure the STK Push was initiated through this server and the transaction ID is correct.`
+      );
+  }
+
+  const html = buildReceipt(txn);
+  return res.status(200).type("html").send(html);
 });
 
-// ─── GLOBAL ERROR HANDLER ─────────────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error("[SERVER ERROR]", err);
-  res.status(500).type("text").send(
-    `Internal server error: ${err.message || "Something went wrong on the server."}`
-  );
+// ─── 404 catch-all ────────────────────────────────────────────────────────────
+app.use((req, res) => {
+  res
+    .status(404)
+    .type("text")
+    .send(
+      `Error: Endpoint "${req.method} ${req.path}" not found.\n\n` +
+        `Available endpoints:\n` +
+        `  POST /pay              — Initiate M-Pesa STK Push\n` +
+        `  POST /webhook          — PalPluss payment callback (internal)\n` +
+        `  GET  /status/:id       — Check transaction status\n` +
+        `  GET  /receipt/:id      — Get coloured HTML payment receipt`
+    );
 });
 
-// ─── START ────────────────────────────────────────────────────────────────────
+// ─── Global error handler ─────────────────────────────────────────────────────
+app.use((err, req, res, _next) => {
+  const errMsg = formatError(err, "server processing");
+  return res.status(500).type("text").send(errMsg);
+});
+
+// ─── Start server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`HashBack deposit server running on port ${PORT}`);
+  console.log(`Payment server running on port ${PORT}`);
   console.log(`Endpoints:`);
-  console.log(`  POST /deposit       — initiate STK push`);
-  console.log(`  POST /check-status  — check transaction status`);
-  console.log(`  POST /webhook       — HashBack payment callback`);
+  console.log(`  POST /pay`);
+  console.log(`  POST /webhook`);
+  console.log(`  GET  /status/:transactionId`);
+  console.log(`  GET  /receipt/:transactionId`);
 });
